@@ -1,0 +1,24 @@
+# --- LLM ---
+anthropic>=0.40.0            # Official Anthropic Python SDK (Claude API)
+
+# --- Web research (no external research APIs) ---
+requests>=2.32.0             # HTTP fetching
+beautifulsoup4>=4.12.0       # HTML parsing
+lxml>=5.3.0                  # Fast HTML/XML parser backend for BeautifulSoup
+
+# --- Markdown knowledge layer ---
+python-frontmatter>=1.1.0    # YAML frontmatter + Markdown body read/write
+markdown>=3.7                # Render final Markdown report to HTML
+
+# --- Data modeling / validation ---
+pydantic>=2.9.0               # Structured state objects + schema validation of Claude's JSON output
+
+# --- App / config ---
+python-dotenv>=1.0.1          # Load .env configuration
+streamlit>=1.39.0             # Demo UI
+
+# --- Reliability ---
+tenacity>=9.0.0                # Retry/backoff for network calls and LLM schema-validation retries
+
+# --- Testing ---
+pytest>=8.3.0

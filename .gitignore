@@ -1,0 +1,30 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Data generated at runtime (keep folder structure via .gitkeep, ignore contents)
+data/raw/*
+!data/raw/.gitkeep
+data/knowledge/**/*.md
+!data/knowledge/**/.gitkeep
+data/reports/*
+!data/reports/.gitkeep
+data/claims.json
+data/state_*.json
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/
