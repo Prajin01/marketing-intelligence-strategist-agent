@@ -24,7 +24,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 @dataclass(frozen=True)
 class Settings:
-    # --- Claude API ---
+    # --- LLM API credentials/model ---
+    # IMPORTANT for transparency: these fields are historically named after
+    # Anthropic, but when llm_provider == "groq" (see below), load_settings()
+    # populates them with the Groq key/model instead. Every downstream
+    # module (extractor, analysis, strategy) reads these same field names
+    # regardless of which provider is actually active — only claude_client.py
+    # branches on llm_provider to decide which API to actually call.
     anthropic_api_key: str
     anthropic_model: str
     anthropic_strategy_model: str
@@ -45,29 +51,49 @@ class Settings:
     # --- Logging ---
     log_level: str
 
+    # --- LLM provider ---
+    # Which LLM backend is actually active: "anthropic" (Claude, paid) or
+    # "groq" (free, open-weight models via Groq's fast inference API).
+    # Defaulted (rather than required) so every existing call site that
+    # constructs Settings() without this field keeps working unchanged.
+    llm_provider: str = "anthropic"
+
 
 def load_settings() -> Settings:
     """
     Build a validated Settings object from environment variables.
 
-    Fails loudly (raises) if the Anthropic API key is missing, since nothing
-    downstream can work without it. Everything else has a sane default so a
-    fresh clone can run with minimal setup.
+    Fails loudly (raises) if the active provider's API key is missing,
+    since nothing downstream can work without it. Everything else has a
+    sane default so a fresh clone can run with minimal setup.
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if not api_key or api_key == "your_api_key_here":
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add your key "
-            "from https://console.anthropic.com/"
-        )
+    llm_provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
+
+    if llm_provider == "groq":
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key or api_key == "your_groq_api_key_here":
+            raise RuntimeError(
+                "GROQ_API_KEY is not set. Copy .env.example to .env and add your free key "
+                "from https://console.groq.com/keys"
+            )
+        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        strategy_model = os.getenv("GROQ_STRATEGY_MODEL") or model
+    else:
+        api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        if not api_key or api_key == "your_api_key_here":
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add your key "
+                "from https://console.anthropic.com/"
+            )
+        model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
+        strategy_model = os.getenv("ANTHROPIC_STRATEGY_MODEL") or model
 
     data_dir = PROJECT_ROOT / os.getenv("DATA_DIR", "data")
 
     settings = Settings(
         anthropic_api_key=api_key,
-        anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5"),
-        anthropic_strategy_model=os.getenv("ANTHROPIC_STRATEGY_MODEL")
-        or os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5"),
+        anthropic_model=model,
+        anthropic_strategy_model=strategy_model,
         max_competitors=int(os.getenv("MAX_COMPETITORS", "6")),
         request_delay_seconds=float(os.getenv("REQUEST_DELAY_SECONDS", "1.5")),
         request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "10")),
@@ -80,6 +106,7 @@ def load_settings() -> Settings:
         reports_dir=data_dir / "reports",
         claims_path=data_dir / "claims.json",
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        llm_provider=llm_provider,
     )
 
     # Ensure the runtime directories exist even on a fresh clone (the

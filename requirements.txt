@@ -1,5 +1,6 @@
 # --- LLM ---
-anthropic>=0.40.0            # Official Anthropic Python SDK (Claude API)
+anthropic>=0.40.0            # Official Anthropic Python SDK (Claude API) — required if LLM_PROVIDER=anthropic
+groq>=0.11.0                 # Official Groq SDK — free, open-weight models; required if LLM_PROVIDER=groq
 
 # --- Web research (no external research APIs) ---
 requests>=2.32.0             # HTTP fetching

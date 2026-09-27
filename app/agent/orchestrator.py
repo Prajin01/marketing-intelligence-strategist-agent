@@ -216,6 +216,7 @@ def run_pipeline(
     settings: Settings,
     search_fn=None,
     resume: bool = False,
+    progress_callback: Optional[Callable[[ResearchState], None]] = None,
 ) -> ResearchState:
     """
     Execute the complete marketing intelligence pipeline.
@@ -235,6 +236,16 @@ def run_pipeline(
         Reserved for future fine-grained stage resumption. The current
         implementation safely reuses persisted state fields where possible.
 
+    progress_callback:
+        Optional callable invoked with the current `state` every time a
+        checkpoint is saved (i.e. after every stage starts and finishes).
+        Added for Phase 8 (Streamlit UI): a UI can pass a callback that
+        updates on-screen stage progress live, during this same blocking
+        call — no polling or background thread needed, since Streamlit
+        flushes UI updates as soon as they happen within the same script
+        run. Optional and backward-compatible: every existing caller
+        (the CLI, tests) that doesn't pass this keeps working unchanged.
+
     Returns
     -------
     ResearchState
@@ -242,6 +253,11 @@ def run_pipeline(
     """
 
     business = state.input
+
+    def _checkpoint(current_state: ResearchState) -> None:
+        _save_state(current_state, settings)
+        if progress_callback is not None:
+            progress_callback(current_state)
 
     # ---------------------------------------------------------------
     # Stage 1 — autonomous research
@@ -254,7 +270,7 @@ def run_pipeline(
             detail="Discovering and researching public web sources.",
         )
 
-        _save_state(state, settings)
+        _checkpoint(state)
 
         try:
             research_result = run_autonomous_research(
@@ -287,11 +303,11 @@ def run_pipeline(
                 ),
             )
 
-            _save_state(state, settings)
+            _checkpoint(state)
 
         except Exception as exc:
             _mark_failure(state, "research", exc)
-            _save_state(state, settings)
+            _checkpoint(state)
             raise
 
     # ---------------------------------------------------------------
@@ -314,7 +330,7 @@ def run_pipeline(
             detail="Converting raw research into knowledge documents.",
         )
 
-        _save_state(state, settings)
+        _checkpoint(state)
 
         try:
             knowledge_posts = _documents_to_posts(
@@ -339,11 +355,11 @@ def run_pipeline(
                 detail=f"Processed {len(knowledge_posts)} knowledge documents.",
             )
 
-            _save_state(state, settings)
+            _checkpoint(state)
 
         except Exception as exc:
             _mark_failure(state, "processing", exc)
-            _save_state(state, settings)
+            _checkpoint(state)
             raise
 
     # ---------------------------------------------------------------
@@ -357,7 +373,7 @@ def run_pipeline(
             detail="Extracting evidence-backed claims.",
         )
 
-        _save_state(state, settings)
+        _checkpoint(state)
 
         try:
             state.claims = extract_claims_from_documents(
@@ -371,11 +387,11 @@ def run_pipeline(
                 detail=f"Extracted {len(state.claims)} evidence-backed claims.",
             )
 
-            _save_state(state, settings)
+            _checkpoint(state)
 
         except Exception as exc:
             _mark_failure(state, "extraction", exc)
-            _save_state(state, settings)
+            _checkpoint(state)
             raise
 
     # ---------------------------------------------------------------
@@ -389,7 +405,7 @@ def run_pipeline(
             detail="Analyzing business, competitors, customers, content, and market.",
         )
 
-        _save_state(state, settings)
+        _checkpoint(state)
 
         claims = state.claims
 
@@ -438,11 +454,11 @@ def run_pipeline(
                 detail="Completed five marketing analysis dimensions.",
             )
 
-            _save_state(state, settings)
+            _checkpoint(state)
 
         except Exception as exc:
             _mark_failure(state, "analysis", exc)
-            _save_state(state, settings)
+            _checkpoint(state)
             raise
 
     # ---------------------------------------------------------------
@@ -456,7 +472,7 @@ def run_pipeline(
             detail="Generating evidence-backed marketing strategy.",
         )
 
-        _save_state(state, settings)
+        _checkpoint(state)
 
         try:
             state.strategy = generate_strategy(
@@ -475,11 +491,11 @@ def run_pipeline(
                 detail="Marketing strategy generated.",
             )
 
-            _save_state(state, settings)
+            _checkpoint(state)
 
         except Exception as exc:
             _mark_failure(state, "strategy", exc)
-            _save_state(state, settings)
+            _checkpoint(state)
             raise
 
     # ---------------------------------------------------------------
@@ -495,7 +511,7 @@ def run_pipeline(
             detail="Generating evidence-backed campaign concepts.",
         )
 
-        _save_state(state, settings)
+        _checkpoint(state)
 
         try:
             campaigns = generate_campaigns(
@@ -515,11 +531,11 @@ def run_pipeline(
                 detail="Campaign concepts generated.",
             )
 
-            _save_state(state, settings)
+            _checkpoint(state)
 
         except Exception as exc:
             _mark_failure(state, "campaigns", exc)
-            _save_state(state, settings)
+            _checkpoint(state)
             raise
     else:
         campaigns = state.strategy.get("campaigns", {})
@@ -537,7 +553,7 @@ def run_pipeline(
             detail="Turning strategy into executable marketing actions.",
         )
 
-        _save_state(state, settings)
+        _checkpoint(state)
 
         try:
             action_plan = generate_action_plan(
@@ -556,11 +572,11 @@ def run_pipeline(
                 detail="Action plan generated.",
             )
 
-            _save_state(state, settings)
+            _checkpoint(state)
 
         except Exception as exc:
             _mark_failure(state, "action_plan", exc)
-            _save_state(state, settings)
+            _checkpoint(state)
             raise
 
     # ---------------------------------------------------------------
@@ -574,7 +590,7 @@ def run_pipeline(
             detail="Validating evidence references and strategy integrity.",
         )
 
-        _save_state(state, settings)
+        _checkpoint(state)
 
         try:
             # Validation module is intentionally imported lazily.
@@ -596,7 +612,7 @@ def run_pipeline(
                 detail="Pipeline validation completed.",
             )
 
-            _save_state(state, settings)
+            _checkpoint(state)
 
         except ImportError:
             # Validation implementation may not exist yet.
@@ -613,11 +629,11 @@ def run_pipeline(
                 detail="Validation module unavailable.",
             )
 
-            _save_state(state, settings)
+            _checkpoint(state)
 
         except Exception as exc:
             _mark_failure(state, "validation", exc)
-            _save_state(state, settings)
+            _checkpoint(state)
             raise
 
     logger.info(
@@ -639,7 +655,9 @@ def run_new(
     location: str,
     objective: str,
     settings: Settings,
+    homepage_url: str = "",
     search_fn=None,
+    progress_callback: Optional[Callable[[ResearchState], None]] = None,
 ) -> ResearchState:
     """
     Create a new ResearchState and run the full pipeline.
@@ -652,6 +670,7 @@ def run_new(
         industry=industry,
         location=location,
         objective=objective,
+        homepage_url=homepage_url,
     )
 
     state = ResearchState.new(business_input)
@@ -663,11 +682,14 @@ def run_new(
     )
 
     _save_state(state, settings)
+    if progress_callback is not None:
+        progress_callback(state)
 
     return run_pipeline(
         state=state,
         settings=settings,
         search_fn=search_fn,
+        progress_callback=progress_callback,
     )
 
 
@@ -675,6 +697,7 @@ def resume_from_file(
     path: Path,
     settings: Settings,
     search_fn=None,
+    progress_callback: Optional[Callable[[ResearchState], None]] = None,
 ) -> ResearchState:
     """Load a persisted state and continue the pipeline."""
 
@@ -691,6 +714,7 @@ def resume_from_file(
         settings=settings,
         search_fn=search_fn,
         resume=True,
+        progress_callback=progress_callback,
     )
 
 

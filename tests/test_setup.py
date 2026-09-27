@@ -13,6 +13,14 @@ from app.agent.state import BusinessInput, ResearchState, StageStatus
 @pytest.fixture(autouse=True)
 def fake_api_key(monkeypatch):
     # Config requires an API key to load; tests don't need a real one.
+    # IMPORTANT: also force LLM_PROVIDER=anthropic explicitly — without this,
+    # this test isn't isolated from whatever provider a developer's real
+    # .env happens to have configured (e.g. LLM_PROVIDER=groq), which would
+    # make load_settings() read and return the developer's REAL Groq key
+    # here instead of this fake one — a real key exposure this project hit
+    # in practice, in a pytest failure diff. Every field this test depends
+    # on must be pinned, not just the one it's directly asserting on.
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
 
 
