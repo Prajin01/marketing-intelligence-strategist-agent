@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
 from typing import Any, Optional
 
 from app.config import Settings
@@ -36,6 +38,22 @@ _MAX_JSON_RETRIES = 2
 # prompt, especially for the largest-output stages (strategy, campaigns,
 # action plan, each combining many claims/analyses into one response).
 DEFAULT_MAX_TOKENS = 6000
+
+# Groq's free tier enforces a tokens-per-minute (TPM) limit per model. A
+# full research run makes many LLM calls back to back, so hitting that
+# limit mid-run is expected rather than exceptional. Groq's 429 response
+# says exactly how long to wait ("Please try again in 28.5s"), so the
+# right behaviour is to wait that long and retry — not to fail the run.
+_GROQ_RATE_LIMIT_RETRIES = 5
+_GROQ_MAX_WAIT_SECONDS = 65.0  # TPM windows reset each minute; never wait longer than that
+_GROQ_DEFAULT_WAIT_SECONDS = 20.0
+
+# Guard against a single request being too large for the free-tier TPM
+# window. Roughly 4 characters per token, so 16,000 chars is ~4,000 input
+# tokens. The start and end of the prompt are kept (that's where the task
+# instructions and output format usually live) and the middle is trimmed.
+_GROQ_MAX_PROMPT_CHARS = 16000
+_GROQ_PROMPT_TAIL_CHARS = 3000
 
 
 class ClaudeJSONError(Exception):
@@ -66,6 +84,45 @@ def _send_anthropic(settings: Settings, system_prompt: str, user_prompt: str, mo
     return "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
 
 
+def _groq_wait_seconds(exc: Exception) -> float:
+    """
+    Work out how long Groq asked us to wait. Prefers the Retry-After header,
+    falls back to parsing the human-readable message (formats seen in the
+    wild: "28.53s", "1m2.5s", "520ms"), and finally a safe default.
+    """
+    try:
+        header = exc.response.headers.get("retry-after")  # type: ignore[attr-defined]
+        if header:
+            return min(float(header) + 1.0, _GROQ_MAX_WAIT_SECONDS)
+    except Exception:  # noqa: BLE001 - header parsing is best-effort
+        pass
+
+    match = re.search(r"try again in (?:(\d+)m(?!s))?([\d.]+)(ms|s)", str(exc))
+    if match:
+        minutes = float(match.group(1) or 0)
+        amount = float(match.group(2))
+        seconds = amount / 1000.0 if match.group(3) == "ms" else amount
+        return min(minutes * 60.0 + seconds + 1.0, _GROQ_MAX_WAIT_SECONDS)
+
+    return _GROQ_DEFAULT_WAIT_SECONDS
+
+
+def _trim_prompt_for_groq(user_prompt: str) -> str:
+    """Keep the head and tail of an oversized prompt and trim the middle."""
+    if len(user_prompt) <= _GROQ_MAX_PROMPT_CHARS:
+        return user_prompt
+    head_chars = _GROQ_MAX_PROMPT_CHARS - _GROQ_PROMPT_TAIL_CHARS
+    logger.warning(
+        "Prompt is %d chars; trimming to ~%d to fit Groq free-tier limits.",
+        len(user_prompt), _GROQ_MAX_PROMPT_CHARS,
+    )
+    return (
+        user_prompt[:head_chars]
+        + "\n\n[... source text trimmed to fit model limits ...]\n\n"
+        + user_prompt[-_GROQ_PROMPT_TAIL_CHARS:]
+    )
+
+
 def _send_groq(settings: Settings, system_prompt: str, user_prompt: str, model: str, max_tokens: int) -> str:
     """
     Groq hosts open-weight models (Llama, Mixtral, etc.) with a free tier
@@ -73,19 +130,39 @@ def _send_groq(settings: Settings, system_prompt: str, user_prompt: str, model: 
     zero-cost substitute for the Claude API when no API budget is
     available — see README for the disclosure of this substitution and
     why it was made.
-    """
-    from groq import Groq  # lazy import: only required when this provider is actually used
 
-    client = Groq(api_key=settings.anthropic_api_key)
-    response = client.chat.completions.create(
-        model=model,
-        max_tokens=max_tokens,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    return response.choices[0].message.content or ""
+    Free-tier rate limits (HTTP 429) are handled by waiting the time Groq
+    asks for and retrying. Daily limits are not retried, since waiting a
+    minute cannot fix them.
+    """
+    from groq import Groq, RateLimitError  # lazy import: only required when this provider is actually used
+
+    client = Groq(api_key=settings.anthropic_api_key, max_retries=0)
+    safe_prompt = _trim_prompt_for_groq(user_prompt)
+
+    for attempt in range(_GROQ_RATE_LIMIT_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": safe_prompt},
+                ],
+            )
+            return response.choices[0].message.content or ""
+        except RateLimitError as exc:
+            message = str(exc).lower()
+            if "per day" in message or attempt == _GROQ_RATE_LIMIT_RETRIES:
+                raise
+            wait = _groq_wait_seconds(exc)
+            logger.warning(
+                "Groq rate limit hit (attempt %d/%d); waiting %.1fs before retrying.",
+                attempt + 1, _GROQ_RATE_LIMIT_RETRIES + 1, wait,
+            )
+            time.sleep(wait)
+
+    raise RuntimeError("unreachable")  # loop always returns or raises
 
 
 def _strip_code_fences(text: str) -> str:

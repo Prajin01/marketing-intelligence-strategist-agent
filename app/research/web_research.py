@@ -15,6 +15,9 @@ requirement):
     caught and returned as a structured result — never raised uncaught,
     since one bad source should never crash a whole research run.
   - Nothing here ever attempts to bypass a login wall, CAPTCHA, or paywall.
+    Sites that are login-walled for anonymous visitors (major social
+    networks) are skipped up front with a clear reason, rather than being
+    requested only to fail.
 """
 
 from __future__ import annotations
@@ -29,6 +32,8 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from app.config import Settings
 
@@ -36,6 +41,31 @@ logger = logging.getLogger(__name__)
 
 # Tags whose text is never part of the "main content" of a page.
 _NOISE_TAGS = ("script", "style", "nav", "footer", "header", "noscript", "svg", "form")
+
+# Sites whose public pages are login-walled for anonymous, non-browser
+# clients. Requesting them always fails, so they are skipped by design
+# (respecting access controls) with an explicit, honest reason.
+_LOGIN_WALLED_DOMAINS = (
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "x.com",
+    "twitter.com",
+    "threads.net",
+)
+
+# Standard headers every browser sends. The User-Agent itself stays the
+# agent's own honest identifier from Settings; these just stop some servers
+# rejecting requests that omit ordinary content-negotiation headers.
+_DEFAULT_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-IN,en;q=0.9",
+}
+
+
+def _is_login_walled(url: str) -> bool:
+    netloc = urlparse(url).netloc.lower()
+    return any(netloc == d or netloc.endswith("." + d) for d in _LOGIN_WALLED_DOMAINS)
 
 
 @dataclass
@@ -80,18 +110,48 @@ class RobotsChecker:
     """
     Caches one urllib.robotparser.RobotFileParser per domain, so we don't
     re-fetch robots.txt on every single page request to the same site.
+
+    When a requests.Session is supplied, robots.txt is fetched through it,
+    so the request carries the agent's own User-Agent. Without that,
+    RobotFileParser.read() uses Python's default "Python-urllib" identity,
+    which many servers block with a 403 — and read() then marks the ENTIRE
+    site as disallowed, even though RFC 9309 says a 4xx on robots.txt means
+    no restrictions apply. That silently blocked many legitimate sites.
     """
 
-    def __init__(self, user_agent: str):
+    def __init__(self, user_agent: str, session: Optional[requests.Session] = None, timeout: float = 10.0):
         self._user_agent = user_agent
+        self._session = session
+        self._timeout = timeout
         self._parsers: dict[str, robotparser.RobotFileParser] = {}
+
+    def _load_with_session(self, parser: robotparser.RobotFileParser, robots_url: str, domain_root: str) -> None:
+        response = self._session.get(robots_url, timeout=self._timeout)  # type: ignore[union-attr]
+        if 400 <= response.status_code < 500:
+            # RFC 9309 §2.3.1.3: robots.txt "unavailable" (4xx) -> no restrictions.
+            logger.info("robots.txt for %s returned HTTP %d — treating as allowed.",
+                        domain_root, response.status_code)
+            parser.allow_all = True
+        elif response.status_code != 200:
+            logger.warning("robots.txt for %s returned HTTP %d — assuming allowed.",
+                           domain_root, response.status_code)
+            parser.allow_all = True
+        else:
+            parser.parse(response.text.splitlines())
+            # parse() does not set last_checked, and can_fetch() returns
+            # False while last_checked is unset. modified() sets it.
+            parser.modified()
 
     def _get_parser(self, domain_root: str) -> robotparser.RobotFileParser:
         if domain_root not in self._parsers:
             parser = robotparser.RobotFileParser()
-            parser.set_url(urljoin(domain_root, "/robots.txt"))
+            robots_url = urljoin(domain_root, "/robots.txt")
+            parser.set_url(robots_url)
             try:
-                parser.read()
+                if self._session is not None:
+                    self._load_with_session(parser, robots_url, domain_root)
+                else:
+                    parser.read()
             except Exception as exc:  # noqa: BLE001 - robots.txt fetch failing is not fatal
                 logger.warning("Could not read robots.txt for %s (%s) — assuming allowed.", domain_root, exc)
                 # IMPORTANT: RobotFileParser.can_fetch() returns False by
@@ -170,6 +230,16 @@ def extract_content(html: str, base_url: str) -> tuple[str, Optional[str], str, 
     return title, meta_description, main_text, links
 
 
+def _describe_connection_error(exc: Exception) -> str:
+    """Turn low-level connection errors into a short, readable reason."""
+    text = str(exc)
+    if "NameResolutionError" in text or "getaddrinfo failed" in text or "Name or service not known" in text:
+        return "Information unavailable — domain does not exist or could not be resolved"
+    if "SSLError" in text or "CERTIFICATE_VERIFY_FAILED" in text:
+        return "Information unavailable — site has an invalid SSL certificate"
+    return f"Information unavailable — connection error ({exc})"
+
+
 class WebResearcher:
     """
     The single object every research module uses to fetch pages. Holds the
@@ -179,10 +249,32 @@ class WebResearcher:
 
     def __init__(self, settings: Settings):
         self._settings = settings
-        self._robots = RobotsChecker(settings.user_agent)
-        self._rate_limiter = RateLimiter(settings.request_delay_seconds)
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": settings.user_agent})
+        self._session.headers.update({"User-Agent": settings.user_agent, **_DEFAULT_HEADERS})
+
+        # Polite retries for transient failures only: brief network blips,
+        # server errors, and 429s (honouring the server's Retry-After).
+        # raise_on_status=False returns the final response so the normal
+        # status-code handling below still produces a structured result.
+        retry = Retry(
+            total=2,
+            connect=1,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET"]),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+
+        self._robots = RobotsChecker(
+            settings.user_agent,
+            session=self._session,
+            timeout=settings.request_timeout_seconds,
+        )
+        self._rate_limiter = RateLimiter(settings.request_delay_seconds)
 
     def fetch(self, url: str) -> FetchResult:
         """
@@ -190,7 +282,20 @@ class WebResearcher:
         every failure mode becomes a FetchResult with ok=False and a
         human-readable `error`.
         """
-        if not self._robots.is_allowed(url):
+        if _is_login_walled(url):
+            logger.info("Skipping %s — login-walled site, not accessed by design", url)
+            return FetchResult(
+                url=url,
+                ok=False,
+                error="Information unavailable — site requires login; skipped by design (access controls respected)",
+            )
+
+        try:
+            allowed = self._robots.is_allowed(url)
+        except Exception as exc:  # noqa: BLE001 - never let the robots check crash a run
+            logger.warning("robots.txt check failed for %s (%s) — assuming allowed.", url, exc)
+            allowed = True
+        if not allowed:
             logger.info("Skipping %s — disallowed by robots.txt", url)
             return FetchResult(url=url, ok=False, error="Information unavailable — robots.txt disallows access")
 
@@ -201,17 +306,17 @@ class WebResearcher:
         except requests.exceptions.Timeout:
             return FetchResult(url=url, ok=False, error="Information unavailable — request timed out")
         except requests.exceptions.ConnectionError as exc:
-            return FetchResult(url=url, ok=False, error=f"Information unavailable — connection error ({exc})")
+            return FetchResult(url=url, ok=False, error=_describe_connection_error(exc))
         except requests.exceptions.RequestException as exc:
             return FetchResult(url=url, ok=False, error=f"Information unavailable — request failed ({exc})")
 
         if response.status_code != 200:
-            return FetchResult(
-                url=url,
-                ok=False,
-                status_code=response.status_code,
-                error=f"Information unavailable — HTTP {response.status_code}",
-            )
+            reason = f"Information unavailable — HTTP {response.status_code}"
+            if response.status_code in (401, 403):
+                reason += " (site refused automated access)"
+            elif response.status_code == 404:
+                reason += " (page not found)"
+            return FetchResult(url=url, ok=False, status_code=response.status_code, error=reason)
 
         content_type = response.headers.get("Content-Type", "")
         if "text/html" not in content_type:
@@ -248,7 +353,7 @@ class WebResearcher:
                 url=url,
                 ok=False,
                 status_code=response.status_code,
-                error="Information unavailable — page had no extractable text",
+                error="Information unavailable — page had no extractable text (likely built entirely with JavaScript)",
             )
 
         return FetchResult(
